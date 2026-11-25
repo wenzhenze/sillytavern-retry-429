@@ -1,0 +1,9 @@
+{
+    "display_name": "429 自动重试",
+    "version": "1.0.0",
+    "author": "Codex",
+    "js": "index.js",
+    "loading_order": 100,
+    "auto_update": false,
+    "minimum_client_version": "1.19.1"
+}
