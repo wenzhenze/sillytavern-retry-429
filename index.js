@@ -1,4 +1,10 @@
-const retryDelays = [2000, 4000, 8000];
+const settingsKey = 'sillytavern-retry-429';
+const settingFields = {
+    maxRetries: { initial: 0, min: 0, max: 99999 },
+    firstDelay: { initial: 2, min: 1, max: 86400 },
+    secondDelay: { initial: 4, min: 1, max: 86400 },
+    repeatDelay: { initial: 8, min: 1, max: 86400 },
+};
 const generationPaths = {
     openai: '/api/backends/chat-completions/generate',
     textgenerationwebui: '/api/backends/text-completions/generate',
@@ -86,28 +92,65 @@ function retryDelay(response, fallback) {
     const header = response.headers.get('retry-after')?.trim();
     if (!header) return fallback;
     const delay = /^\d+$/.test(header) ? Number(header) * 1000 : Date.parse(header) - Date.now();
-    if (Number.isNaN(delay)) return fallback;
+    if (!Number.isSafeInteger(delay)) return fallback;
     return Math.max(fallback, delay);
 }
 
-function wait(ms, signal) {
-    signal.throwIfAborted();
-    return new Promise((resolve, reject) => {
-        const timer = setTimeout(() => {
-            signal.removeEventListener('abort', stop);
-            resolve();
-        }, ms);
-        function stop() {
-            clearTimeout(timer);
-            reject(signal.reason);
-        }
-        signal.addEventListener('abort', stop, { once: true });
-    });
+async function wait(ms, signal) {
+    const deadline = Date.now() + ms;
+    while (ms > 0) {
+        signal.throwIfAborted();
+        await new Promise((resolve, reject) => {
+            const timer = setTimeout(() => {
+                signal.removeEventListener('abort', stop);
+                resolve();
+            }, Math.min(ms, 2_147_483_647));
+            function stop() {
+                clearTimeout(timer);
+                reject(signal.reason);
+            }
+            signal.addEventListener('abort', stop, { once: true });
+        });
+        ms = deadline - Date.now();
+    }
 }
 
-const { eventSource, eventTypes } = SillyTavern.getContext();
+const { eventSource, eventTypes, extensionSettings, saveSettingsDebounced } = SillyTavern.getContext();
 let pendingGeneration;
 let retryScope = new AbortController();
+
+function readSettings() {
+    const saved = extensionSettings[settingsKey];
+    return Object.fromEntries(Object.entries(settingFields).map(([key, { initial, min, max }]) => {
+        const value = saved?.[key];
+        return [key, Number.isInteger(value) && value >= min && value <= max ? value : initial];
+    }));
+}
+
+async function mountSettings() {
+    const container = document.querySelector('#extensions_settings2');
+    if (!container) return;
+    const template = await fetch(new URL('./settings.html', import.meta.url));
+    if (!template.ok) throw new Error(`Settings template returned HTTP ${template.status}`);
+    container.insertAdjacentHTML('beforeend', await template.text());
+
+    const settings = readSettings();
+    const inputs = container.querySelectorAll('#sillytavern-retry-429-settings input');
+    for (const input of inputs) {
+        const key = input.name;
+        const { min, max } = settingFields[key];
+        input.min = String(min);
+        input.max = String(max);
+        input.value = String(settings[key]);
+        input.addEventListener('change', () => {
+            if (!input.reportValidity()) return;
+            extensionSettings[settingsKey] = { ...readSettings(), [key]: input.valueAsNumber };
+            saveSettingsDebounced();
+        });
+    }
+}
+
+void mountSettings().catch(error => console.error('429 自动重试设置加载失败', error));
 
 eventSource.on(eventTypes.GENERATE_AFTER_DATA, (data, dryRun) => {
     if (dryRun || document.body.dataset.generating !== 'true') return;
@@ -148,17 +191,20 @@ globalThis.fetch = async function (input, init) {
     pendingGeneration = undefined;
     const signal = AbortSignal.any([init.signal, retryScope.signal]);
     const streaming = payload.stream === true || payload.streaming === true;
+    const { maxRetries, firstDelay, secondDelay, repeatDelay } = readSettings();
+    const retryDelays = [firstDelay, secondDelay, repeatDelay].map(seconds => seconds * 1000);
     let response = await fetchRequest();
 
-    for (const [index, fallback] of retryDelays.entries()) {
-        if (signal.aborted || !await isRetryable(response, streaming)) break;
+    let retryCount = 0;
+    while (!signal.aborted && (maxRetries === 0 || retryCount < maxRetries) && await isRetryable(response, streaming)) {
         signal.throwIfAborted();
+        const fallback = retryDelays[Math.min(retryCount, retryDelays.length - 1)];
         const delay = retryDelay(response, fallback);
-        if (delay > 60000) break;
+        retryCount++;
 
         // Discard the failed response only when there will be a retry.
         void response.body?.cancel().catch(() => {});
-        globalThis.toastr?.info(`将在 ${Math.ceil(delay / 1000)} 秒后重试（${index + 1}/${retryDelays.length}）`, '生成限流', {
+        globalThis.toastr?.info(`将在 ${Math.ceil(delay / 1000)} 秒后进行第 ${retryCount} 次重试`, '生成限流', {
             timeOut: Math.min(delay, 5000),
         });
         await wait(delay, signal);

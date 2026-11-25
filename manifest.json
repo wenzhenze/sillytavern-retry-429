@@ -1,6 +1,6 @@
 {
     "display_name": "429 自动重试",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "author": "Codex",
     "js": "index.js",
     "loading_order": 100,

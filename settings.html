@@ -1,0 +1,28 @@
+<div id="sillytavern-retry-429-settings" class="inline-drawer">
+    <div class="inline-drawer-toggle inline-drawer-header">
+        <b>429 自动重试</b>
+        <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+    </div>
+    <div class="inline-drawer-content">
+        <label>
+            最大重试次数（0 为无限）
+            <input class="text_pole" name="maxRetries" type="number" step="1" required>
+        </label>
+        <b>每次重试前等待（秒）</b>
+        <div class="flex-container">
+            <label class="flex1">
+                第 1 次
+                <input class="text_pole" name="firstDelay" type="number" step="1" required>
+            </label>
+            <label class="flex1">
+                第 2 次
+                <input class="text_pole" name="secondDelay" type="number" step="1" required>
+            </label>
+            <label class="flex1">
+                第 3 次起
+                <input class="text_pole" name="repeatDelay" type="number" step="1" required>
+            </label>
+        </div>
+        <small>设置自动保存，下次生成时生效。接口要求等待更久时，以接口为准。</small>
+    </div>
+</div>
