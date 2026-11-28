@@ -4,6 +4,23 @@
         <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
     </div>
     <div class="inline-drawer-content">
+        <label class="checkbox_label">
+            <input name="retryRateLimit" type="checkbox">
+            Vertex AI 429 和其他接口限流
+        </label>
+        <label class="checkbox_label">
+            <input name="retrySafetyError" type="checkbox">
+            自定义 API 的安全政策拦截
+        </label>
+        <label class="checkbox_label">
+            <input name="retrySafetyReply" type="checkbox">
+            安全政策拒答或道歉
+        </label>
+        <label class="checkbox_label">
+            <input name="retryEmptyReply" type="checkbox">
+            空回复
+        </label>
+        <div><small>检查聊天补全的拦截、拒答或空回复时，流式回复会先检查完整内容再显示。</small></div>
         <label>
             最大重试次数（0 为无限）
             <input class="text_pole" name="maxRetries" type="number" step="1" required>

@@ -1,5 +1,11 @@
+import { getRetryReason, parseJson } from './retry-response.js';
+
 const settingsKey = 'sillytavern-retry-429';
 const settingFields = {
+    retryRateLimit: { initial: true },
+    retrySafetyError: { initial: true },
+    retrySafetyReply: { initial: true },
+    retryEmptyReply: { initial: true },
     maxRetries: { initial: 0, min: 0, max: 99999 },
     firstDelay: { initial: 2, min: 1, max: 86400 },
     secondDelay: { initial: 4, min: 1, max: 86400 },
@@ -11,82 +17,12 @@ const generationPaths = {
     kobold: '/api/backends/kobold/generate',
     novel: '/api/novelai/generate',
 };
-const limitCode = /^(?:429|rate[_ -]?limit(?:[_ -]?(?:exceeded|error|reached))?|too_many_requests)$/i;
-const limitMessage = /\b(?:resource exhausted\.?\s+please try again later|too many requests|rate limit exceeded)\b|^\s*429\b|\b(?:error(?:\s+code)?|(?:http\s+)?status(?:\s+code)?|http)\s*[:=]?\s*429\b/i;
-const permanentQuota = /\b(?:insufficient[_ -]quota|billing[_ -]hard[_ -]limit(?:[_ -]reached)?|insufficient[_ -]credits)\b/i;
-
-function parseJson(text) {
-    try {
-        return JSON.parse(text);
-    } catch {
-        return undefined;
-    }
-}
-
-function errorDetails(value, depth = 0) {
-    if (depth > 4 || value == null) return [];
-    if (typeof value === 'string') {
-        const nested = /^[\[{]/.test(value.trimStart()) ? parseJson(value) : undefined;
-        return nested ? errorDetails(nested, depth + 1) : [value];
-    }
-    if (typeof value === 'number') return [String(value)];
-    if (Array.isArray(value)) return value.flatMap(item => errorDetails(item, depth + 1));
-    if (value.quota_error === true) return ['insufficient_quota'];
-
-    return ['error', 'detail', 'response', 'message', 'status', 'statusCode', 'status_code', 'code', 'type']
-        .flatMap(key => errorDetails(value[key], depth + 1));
-}
-
-async function readFirstEvent(response) {
-    if (!response.body) return '';
-    const reader = response.clone().body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-    let remainingBytes = 16384;
-
-    try {
-        while (remainingBytes > 0) {
-            const { value, done } = await reader.read();
-            if (done) return buffer + decoder.decode();
-            buffer += decoder.decode(value.subarray(0, remainingBytes), { stream: true });
-            remainingBytes -= value.byteLength;
-
-            const events = buffer.split(/(?:\r\n|\n)(?:\r\n|\n)|\r\r/);
-            buffer = events.pop();
-            for (const event of events) {
-                const data = event.split(/\r\n|\r|\n/)
-                    .filter(line => line.startsWith('data:'))
-                    .map(line => line.slice(5).replace(/^ /, ''))
-                    .join('\n');
-                if (data) return data;
-            }
-        }
-        return '';
-    } finally {
-        // The original branch is still owned by SillyTavern.
-        void reader.cancel().catch(() => {});
-    }
-}
-
-async function isRetryable(response, streaming) {
-    const contentType = response.headers.get('content-type') ?? '';
-    let details = [];
-    try {
-        if (contentType.includes('json') || (!response.ok && !contentType.includes('html'))) {
-            const text = await response.clone().text();
-            details = errorDetails(parseJson(text) ?? text);
-        } else if (response.ok && (streaming || contentType.includes('text/event-stream'))) {
-            const data = await readFirstEvent(response);
-            details = errorDetails(parseJson(data) ?? data);
-        }
-    } catch {
-        // A response with an unreadable body can still carry HTTP 429.
-    }
-
-    if (details.some(detail => permanentQuota.test(detail))) return false;
-    return response.status === 429 || [response.statusText, ...details].some(detail =>
-        limitCode.test(detail.trim()) || limitMessage.test(detail));
-}
+const retryReasonLabels = {
+    retryRateLimit: '生成限流',
+    retrySafetyError: '接口安全政策拦截',
+    retrySafetyReply: '安全政策拒答',
+    retryEmptyReply: '空回复',
+};
 
 function retryDelay(response, fallback) {
     const header = response.headers.get('retry-after')?.trim();
@@ -123,6 +59,7 @@ function readSettings() {
     const saved = extensionSettings[settingsKey];
     return Object.fromEntries(Object.entries(settingFields).map(([key, { initial, min, max }]) => {
         const value = saved?.[key];
+        if (typeof initial === 'boolean') return [key, typeof value === 'boolean' ? value : initial];
         return [key, Number.isInteger(value) && value >= min && value <= max ? value : initial];
     }));
 }
@@ -138,13 +75,18 @@ async function mountSettings() {
     const inputs = container.querySelectorAll('#sillytavern-retry-429-settings input');
     for (const input of inputs) {
         const key = input.name;
-        const { min, max } = settingFields[key];
-        input.min = String(min);
-        input.max = String(max);
-        input.value = String(settings[key]);
+        const checkbox = input.type === 'checkbox';
+        if (checkbox) {
+            input.checked = settings[key];
+        } else {
+            const { min, max } = settingFields[key];
+            input.min = String(min);
+            input.max = String(max);
+            input.value = String(settings[key]);
+        }
         input.addEventListener('change', () => {
             if (!input.reportValidity()) return;
-            extensionSettings[settingsKey] = { ...readSettings(), [key]: input.valueAsNumber };
+            extensionSettings[settingsKey] = { ...readSettings(), [key]: checkbox ? input.checked : input.valueAsNumber };
             saveSettingsDebounced();
         });
     }
@@ -191,20 +133,28 @@ globalThis.fetch = async function (input, init) {
     pendingGeneration = undefined;
     const signal = AbortSignal.any([init.signal, retryScope.signal]);
     const streaming = payload.stream === true || payload.streaming === true;
-    const { maxRetries, firstDelay, secondDelay, repeatDelay } = readSettings();
+    const settings = readSettings();
+    const customApi = payload.chat_completion_source === 'custom';
+    const inspectReply = generation.path === generationPaths.openai
+        && (settings.retryEmptyReply || settings.retrySafetyReply || (customApi && settings.retrySafetyError));
+    if (!settings.retryRateLimit && !inspectReply) return fetchRequest();
+
+    const { maxRetries, firstDelay, secondDelay, repeatDelay } = settings;
     const retryDelays = [firstDelay, secondDelay, repeatDelay].map(seconds => seconds * 1000);
-    let response = await fetchRequest();
+    let response = await originalFetch.call(this, input, { ...init, signal });
 
     let retryCount = 0;
-    while (!signal.aborted && (maxRetries === 0 || retryCount < maxRetries) && await isRetryable(response, streaming)) {
+    while (!signal.aborted && (maxRetries === 0 || retryCount < maxRetries)) {
+        const reason = await getRetryReason(response, { streaming, inspectReply, customApi, signal });
         signal.throwIfAborted();
+        if (!reason || !settings[reason]) break;
         const fallback = retryDelays[Math.min(retryCount, retryDelays.length - 1)];
         const delay = retryDelay(response, fallback);
         retryCount++;
 
         // Discard the failed response only when there will be a retry.
         void response.body?.cancel().catch(() => {});
-        globalThis.toastr?.info(`将在 ${Math.ceil(delay / 1000)} 秒后进行第 ${retryCount} 次重试`, '生成限流', {
+        globalThis.toastr?.info(`将在 ${Math.ceil(delay / 1000)} 秒后进行第 ${retryCount} 次重试`, retryReasonLabels[reason], {
             timeOut: Math.min(delay, 5000),
         });
         await wait(delay, signal);
